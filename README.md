@@ -77,7 +77,7 @@ of a cryptic compiler error.
 
 ## Installation
 
-### Quick install (recommended)
+### Quick install
 
 ```bash
 sudo ./install.sh
@@ -277,13 +277,3 @@ fails — most problems are one descriptive line away.
 
 ---
 
-## License
-
-MIT License.
-
-## References
-
-- [GNU-EFI](https://sourceforge.net/projects/gnu-efi/)
-- [Linux EFI stub](https://www.kernel.org/doc/html/latest/admin-guide/efi-stub.html)
-- [UEFI Specification](https://uefi.org/specifications)
-- [rEFInd](https://www.rodsbooks.com/refind/) (inspiration)
