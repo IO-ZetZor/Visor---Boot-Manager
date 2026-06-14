@@ -1,18 +1,15 @@
-# Visor
+# Visor 
 
 A minimal, fast, graphical UEFI boot manager written in C.
 
-Visor draws an icon-based boot menu which combines the efficiency and speed of grub with the beauty of refind, capable of booting **Linux** (EFI stub kernels / Unified Kernel
-Images) or chainloading **Windows** (Windows Boot Manager). It is intentionally
-small: a single ~260 KB `.efi`, no external runtime dependencies, no scripting
-engine — just a config file and a handful of PNG assets.
+Visor draws an icon-based boot menu which combines the efficiency and speed of grub with the beauty of refind, capable of booting **Linux** (EFI stub kernels / Unified Kernel Images) or chainloading **Windows** (Windows Boot Manager). It is intentionally small: a single ~260 KB .efi, no external runtime dependencies, no scripting engine — just a config file and a handful of PNG assets.
 
 # Visor Menu
 
 <p align="center">
   <img src="docs/ss1.png" width="49%">
   <img src="docs/ss3.png" width="49%">
-</p>
+</p> 
 
 ## Features
 
@@ -79,7 +76,7 @@ of a cryptic compiler error.
 
 ## Installation
 
-### Quick install
+### Quick install 
 
 ```bash
 sudo ./install.sh
@@ -118,7 +115,7 @@ Visor is unsigned, so with Secure Boot enabled you must sign it with your own
 keys. The easiest way is [`sbctl`](https://github.com/Foxboron/sbctl):
 
 ```bash
-sudo sbctl sign -s <ESP>/EFI/visor/visor_x64.efi
+sudo sbctl sign -s /boot/efi/EFI/visor/visor_x64.efi
 ```
 
 (Re-run that after every rebuild, since signing covers the exact binary.)
@@ -160,6 +157,7 @@ back-slashes, e.g. `\EFI\visor\icons\arch.png`. Colors are `#RRGGBB`.
 | `quiet`           | `1` = black screen during hand-off · `0` = show progress text.                                             |
 | `title`           | Menu title. Empty/absent = `Visor` · `none` = no title · else verbatim.                                    |
 | `font`            | Text font. Currently `jetbrains`. Empty = default.                                                         |
+| `theme`           | Load `themes/<name>.conf`; its UI values override those in `boot.conf`. See [Themes](#themes).             |
 | `title_color`     | Title text color, `#RRGGBB`.                                                                               |
 | `name_color`      | Default entry-name color, `#RRGGBB`.                                                                       |
 | `highlight_color` | Selection accent/underline color, `#RRGGBB`.                                                               |
@@ -177,7 +175,7 @@ back-slashes, e.g. `\EFI\visor\icons\arch.png`. Colors are `#RRGGBB`.
 | `firmware_color`  | Color of the **F**irmware hotkey letter, `#RRGGBB`. Absent = `highlight_color`.                            |
 | `background`      | Full-screen background image (PNG, RGB or RGBA). Falls back to `backgrounds/default.png` if missing/corrupt.|
 
-### Boot entries (Examples)
+### Boot entries
 
 ```conf
 linux {
@@ -230,6 +228,42 @@ make bakefont FONT=/usr/share/fonts/TTF/YourFont.ttf FONT_PX=64
 make
 ```
 
+### Themes
+
+Instead of scattering UI tweaks through `boot.conf`, you can keep a whole look in
+a theme file and switch with a single line.
+
+1. Create `\EFI\visor\themes\<name>.conf` on the ESP (a `themes/` folder is made
+   for you at install time, with a sample `nord.conf`).
+2. Put any UI keys in it — the same keys used in `boot.conf` (colors, sizes,
+   `icon_*`, `underline_*`, `power_position`, `background`, `title`, …).
+3. In `boot.conf`, set `theme=<name>`.
+
+When a theme is set, its values **override** whatever `boot.conf` specifies for
+those keys. Keys the theme doesn't mention keep their `boot.conf`/default value.
+Boot entries (`linux {}` / `windows {}`) always live in `boot.conf` — themes are
+UI-only.
+
+```conf
+# boot.conf
+theme=nord
+```
+
+```conf
+# themes/nord.conf  (overrides boot.conf's UI)
+title=Visor
+title_color=#88C0D0
+name_color=#ECEFF4
+underline_color=#A3BE8C
+underline_thickness=8
+icon_size=128
+power_position=bottomright
+shutdown_color=#BF616A
+reboot_color=#EBCB8B
+firmware_color=#A3BE8C
+background=\EFI\visor\backgrounds\default.png
+```
+
 ---
 
 ## Controls
@@ -278,6 +312,7 @@ fails — most problems are one descriptive line away.
 | **No graphics at all**          | Firmware must provide GOP; disable CSM / Legacy boot in firmware setup.       |
 
 ---
+
 
 MASSIVELY INSPIRED BY rEFInd!!
 
