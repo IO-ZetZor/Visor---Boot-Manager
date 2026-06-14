@@ -210,11 +210,185 @@ static EFI_STATUS detect_entries(config_t *config) {
     return EFI_SUCCESS;
 }
 
+static CHAR16* read_text_file(CHAR16 *path) {
+    efi_file_t *file = efi_fopen(path);
+    if (!file) return NULL;
+
+    UINT8 *raw = NULL;
+    UINTN  raw_len = 0;
+    UINTN  raw_cap = 4096;
+    raw = efi_allocate_pool(raw_cap);
+    if (!raw) { efi_fclose(file); return NULL; }
+
+    for (;;) {
+        if (raw_len + 512 > raw_cap) {
+            raw_cap *= 2;
+            UINT8 *nb = efi_allocate_pool(raw_cap);
+            if (!nb) break;
+            for (UINTN i = 0; i < raw_len; i++) nb[i] = raw[i];
+            efi_free_pool(raw);
+            raw = nb;
+        }
+        UINTN n = efi_fread(file, raw + raw_len, 512);
+        if (n == 0) break;
+        raw_len += n;
+    }
+    efi_fclose(file);
+
+    UINTN off = 0;
+    int   utf16 = 0;
+    if (raw_len >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
+        utf16 = 1; off = 2;
+    } else if (raw_len >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) {
+        off = 3;
+    } else if (raw_len >= 2 && raw[1] == 0x00 && raw[0] != 0x00) {
+        utf16 = 1;
+    }
+
+    UINTN   char_count = utf16 ? (raw_len - off) / 2 : (raw_len - off);
+    CHAR16 *buf = efi_allocate_pool((char_count + 1) * sizeof(CHAR16));
+    if (!buf) { efi_free_pool(raw); return NULL; }
+
+    if (utf16) {
+        for (UINTN i = 0; i < char_count; i++)
+            buf[i] = (CHAR16)(raw[off + i*2] | (raw[off + i*2 + 1] << 8));
+    } else {
+        for (UINTN i = 0; i < char_count; i++)
+            buf[i] = (CHAR16)raw[off + i];
+    }
+    buf[char_count] = '\0';
+    efi_free_pool(raw);
+    return buf;
+}
+
+static void apply_global(config_t *config, CHAR16 *key, CHAR16 *value) {
+    if (efi_strcmp(key, L"timeout") == 0) {
+        INTN sign = 1;
+        if (*value == '-') { sign = -1; value++; }
+        INTN t = 0;
+        while (*value >= '0' && *value <= '9') { t = t * 10 + (*value - '0'); value++; }
+        config->timeout = (sign < 0) ? -1 : t;
+    } else if (efi_strcmp(key, L"default") == 0) {
+        config->default_entry = 0;
+        while (*value >= '0' && *value <= '9') {
+            config->default_entry = config->default_entry * 10 + (*value - '0');
+            value++;
+        }
+    } else if (efi_strcmp(key, L"quiet") == 0) {
+        config->quiet = (*value == '1' || *value == 't' || *value == 'y');
+    } else if (efi_strcmp(key, L"theme") == 0) {
+        config->theme = (value[0] == '\0') ? NULL : efi_strdup(value);
+    } else if (efi_strcmp(key, L"title") == 0) {
+        if (efi_strcmp(value, L"none") == 0) {
+            config->no_title = 1;
+            config->title = NULL;
+        } else if (value[0] == '\0') {
+            config->no_title = 0;
+            config->title = NULL;
+        } else {
+            config->no_title = 0;
+            config->title = efi_strdup(value);
+        }
+    } else if (efi_strcmp(key, L"font") == 0) {
+        config->font = (value[0] == '\0') ? NULL : efi_strdup(value);
+    } else if (efi_strcmp(key, L"title_color") == 0) {
+        if (!parse_color(value, &config->title_color))
+            efi_log(L"WARN: invalid title_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"name_color") == 0) {
+        if (!parse_color(value, &config->name_color))
+            efi_log(L"WARN: invalid name_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"highlight_color") == 0) {
+        if (!parse_color(value, &config->highlight_color))
+            efi_log(L"WARN: invalid highlight_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"title_size") == 0) {
+        config->title_size = parse_uint(value);
+    } else if (efi_strcmp(key, L"name_size") == 0) {
+        config->name_size = parse_uint(value);
+    } else if (efi_strcmp(key, L"icon_size") == 0) {
+        config->icon_size = parse_uint(value);
+    } else if (efi_strcmp(key, L"icon_spacing") == 0) {
+        config->icon_spacing = parse_uint(value);
+    } else if (efi_strcmp(key, L"icon_y") == 0) {
+        config->icon_y = parse_uint(value);
+    } else if (efi_strcmp(key, L"underline_color") == 0) {
+        if (parse_color(value, &config->underline_color))
+            config->has_underline_color = 1;
+        else
+            efi_log(L"WARN: invalid underline_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"underline_thickness") == 0) {
+        config->underline_thickness = parse_uint(value);
+    } else if (efi_strcmp(key, L"underline_length") == 0) {
+        config->underline_length = parse_uint(value);
+    } else if (efi_strcmp(key, L"power_position") == 0) {
+        if (efi_strcmp(value, L"topright") == 0)
+            config->power_position = POWER_POS_TOPRIGHT;
+        else if (efi_strcmp(value, L"topleft") == 0)
+            config->power_position = POWER_POS_TOPLEFT;
+        else if (efi_strcmp(value, L"bottomleft") == 0)
+            config->power_position = POWER_POS_BOTTOMLEFT;
+        else if (efi_strcmp(value, L"bottomright") == 0)
+            config->power_position = POWER_POS_BOTTOMRIGHT;
+        else
+            efi_log(L"WARN: invalid power_position (topright/topleft/bottomleft/bottomright)");
+    } else if (efi_strcmp(key, L"shutdown_color") == 0) {
+        if (parse_color(value, &config->shutdown_color))
+            config->has_shutdown_color = 1;
+        else
+            efi_log(L"WARN: invalid shutdown_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"reboot_color") == 0) {
+        if (parse_color(value, &config->reboot_color))
+            config->has_reboot_color = 1;
+        else
+            efi_log(L"WARN: invalid reboot_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"firmware_color") == 0) {
+        if (parse_color(value, &config->firmware_color))
+            config->has_firmware_color = 1;
+        else
+            efi_log(L"WARN: invalid firmware_color (use #RRGGBB)");
+    } else if (efi_strcmp(key, L"background") == 0) {
+        config->background = dup_path(value);
+    }
+}
+
+static void apply_theme(config_t *config, CHAR16 *name) {
+    CHAR16 path[MAX_PATH];
+    SPrint(path, sizeof(path), L"%s\\themes\\%s.conf", CONFIG_DIR, name);
+    efi_log(L"config: loading theme file");
+    efi_log(path);
+
+    CHAR16 *buf = read_text_file(path);
+    if (!buf) { efi_log(L"WARN: theme file not found - keeping boot.conf values"); return; }
+
+    CHAR16 *start = buf;
+    while (*start) {
+        CHAR16 *end = start;
+        while (*end && *end != '\n') end++;
+        if (*end == '\n') *end = '\0';
+        CHAR16 *cr = efi_strchr(start, '\r');
+        if (cr) *cr = '\0';
+
+        CHAR16 *line = trim(start);
+        if (line[0] != '#' && line[0] != '\0') {
+            CHAR16 *eq = efi_strchr(line, '=');
+            if (eq) {
+                *eq = '\0';
+                CHAR16 *key = trim(line);
+                CHAR16 *value = trim(eq + 1);
+                if (efi_strcmp(key, L"theme") != 0)
+                    apply_global(config, key, value);
+            }
+        }
+        start = end + 1;
+    }
+    efi_free_pool(buf);
+}
+
 EFI_STATUS config_parse(config_t *config) {
 
     config->timeout = 5;
     config->default_entry = 0;
     config->quiet = 0;
+    config->theme = NULL;
     config->title = NULL;
     config->no_title = 0;
     config->font = NULL;
@@ -243,58 +417,11 @@ EFI_STATUS config_parse(config_t *config) {
     config->entries = NULL;
     config->entry_count = 0;
 
-    efi_file_t *file = efi_fopen(CONFIG_FILE);
-    if (!file) {
+    CHAR16 *buf = read_text_file(CONFIG_FILE);
+    if (!buf) {
         efi_log(L"config: boot.conf not found, auto-detecting boot entries");
         return detect_entries(config);
     }
-
-    UINT8  *raw = NULL;
-    UINTN   raw_len = 0;
-    UINTN   raw_cap = 4096;
-    raw = efi_allocate_pool(raw_cap);
-    if (!raw) { efi_fclose(file); return EFI_OUT_OF_RESOURCES; }
-
-    for (;;) {
-        if (raw_len + 512 > raw_cap) {
-            raw_cap *= 2;
-            UINT8 *nb = efi_allocate_pool(raw_cap);
-            if (!nb) break;
-            for (UINTN i = 0; i < raw_len; i++) nb[i] = raw[i];
-            efi_free_pool(raw);
-            raw = nb;
-        }
-        UINTN n = efi_fread(file, raw + raw_len, 512);
-        if (n == 0) break;
-        raw_len += n;
-    }
-    efi_fclose(file);
-
-    UINTN  off = 0;
-    int    utf16 = 0;
-    if (raw_len >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
-        utf16 = 1; off = 2;
-    } else if (raw_len >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) {
-        off = 3;
-    } else if (raw_len >= 2 && raw[1] == 0x00 && raw[0] != 0x00) {
-        utf16 = 1;
-    }
-
-    UINTN   char_count = utf16 ? (raw_len - off) / 2 : (raw_len - off);
-    CHAR16 *buf = efi_allocate_pool((char_count + 1) * sizeof(CHAR16));
-    if (!buf) { efi_free_pool(raw); return EFI_OUT_OF_RESOURCES; }
-
-    if (utf16) {
-        for (UINTN i = 0; i < char_count; i++)
-            buf[i] = (CHAR16)(raw[off + i*2] | (raw[off + i*2 + 1] << 8));
-    } else {
-        for (UINTN i = 0; i < char_count; i++)
-            buf[i] = (CHAR16)raw[off + i];
-    }
-    buf[char_count] = '\0';
-    UINTN total = char_count;
-    (void)total;
-    efi_free_pool(raw);
 
     CHAR16 *lines[256];
     UINTN line_count = 0;
@@ -324,94 +451,7 @@ EFI_STATUS config_parse(config_t *config) {
             *eq = '\0';
             CHAR16 *key = trim(line);
             CHAR16 *value = trim(eq + 1);
-
-            if (efi_strcmp(key, L"timeout") == 0) {
-
-                INTN sign = 1;
-                if (*value == '-') { sign = -1; value++; }
-                INTN t = 0;
-                while (*value >= '0' && *value <= '9') {
-                    t = t * 10 + (*value - '0');
-                    value++;
-                }
-                config->timeout = (sign < 0) ? -1 : t;
-            } else if (efi_strcmp(key, L"default") == 0) {
-                config->default_entry = 0;
-                while (*value >= '0' && *value <= '9') {
-                    config->default_entry = config->default_entry * 10 + (*value - '0');
-                    value++;
-                }
-            } else if (efi_strcmp(key, L"quiet") == 0) {
-                config->quiet = (*value == '1' || *value == 't' || *value == 'y');
-            } else if (efi_strcmp(key, L"title") == 0) {
-
-                if (efi_strcmp(value, L"none") == 0) {
-                    config->no_title = 1;
-                    config->title = NULL;
-                } else if (value[0] == '\0') {
-                    config->title = NULL;
-                } else {
-                    config->title = efi_strdup(value);
-                }
-            } else if (efi_strcmp(key, L"font") == 0) {
-                config->font = (value[0] == '\0') ? NULL : efi_strdup(value);
-            } else if (efi_strcmp(key, L"title_color") == 0) {
-                if (!parse_color(value, &config->title_color))
-                    efi_log(L"WARN: invalid title_color (use #RRGGBB)");
-            } else if (efi_strcmp(key, L"name_color") == 0) {
-                if (!parse_color(value, &config->name_color))
-                    efi_log(L"WARN: invalid name_color (use #RRGGBB)");
-            } else if (efi_strcmp(key, L"highlight_color") == 0) {
-                if (!parse_color(value, &config->highlight_color))
-                    efi_log(L"WARN: invalid highlight_color (use #RRGGBB)");
-            } else if (efi_strcmp(key, L"title_size") == 0) {
-                config->title_size = parse_uint(value);
-            } else if (efi_strcmp(key, L"name_size") == 0) {
-                config->name_size = parse_uint(value);
-            } else if (efi_strcmp(key, L"icon_size") == 0) {
-                config->icon_size = parse_uint(value);
-            } else if (efi_strcmp(key, L"icon_spacing") == 0) {
-                config->icon_spacing = parse_uint(value);
-            } else if (efi_strcmp(key, L"icon_y") == 0) {
-                config->icon_y = parse_uint(value);
-            } else if (efi_strcmp(key, L"underline_color") == 0) {
-                if (parse_color(value, &config->underline_color))
-                    config->has_underline_color = 1;
-                else
-                    efi_log(L"WARN: invalid underline_color (use #RRGGBB)");
-            } else if (efi_strcmp(key, L"underline_thickness") == 0) {
-                config->underline_thickness = parse_uint(value);
-            } else if (efi_strcmp(key, L"underline_length") == 0) {
-                config->underline_length = parse_uint(value);
-            } else if (efi_strcmp(key, L"power_position") == 0) {
-                if (efi_strcmp(value, L"topright") == 0)
-                    config->power_position = POWER_POS_TOPRIGHT;
-                else if (efi_strcmp(value, L"topleft") == 0)
-                    config->power_position = POWER_POS_TOPLEFT;
-                else if (efi_strcmp(value, L"bottomleft") == 0)
-                    config->power_position = POWER_POS_BOTTOMLEFT;
-                else if (efi_strcmp(value, L"bottomright") == 0)
-                    config->power_position = POWER_POS_BOTTOMRIGHT;
-                else
-                    efi_log(L"WARN: invalid power_position (topright/topleft/bottomleft/bottomright)");
-            } else if (efi_strcmp(key, L"shutdown_color") == 0) {
-                if (parse_color(value, &config->shutdown_color))
-                    config->has_shutdown_color = 1;
-                else
-                    efi_log(L"WARN: invalid shutdown_color (use #RRGGBB)");
-            } else if (efi_strcmp(key, L"reboot_color") == 0) {
-                if (parse_color(value, &config->reboot_color))
-                    config->has_reboot_color = 1;
-                else
-                    efi_log(L"WARN: invalid reboot_color (use #RRGGBB)");
-            } else if (efi_strcmp(key, L"firmware_color") == 0) {
-                if (parse_color(value, &config->firmware_color))
-                    config->has_firmware_color = 1;
-                else
-                    efi_log(L"WARN: invalid firmware_color (use #RRGGBB)");
-            } else if (efi_strcmp(key, L"background") == 0) {
-                config->background = dup_path(value);
-            }
+            apply_global(config, key, value);
             continue;
         }
 
@@ -423,6 +463,8 @@ EFI_STATUS config_parse(config_t *config) {
             }
         }
     }
+
+    if (config->theme) apply_theme(config, config->theme);
 
     efi_free_pool(buf);
 
