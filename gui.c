@@ -12,6 +12,36 @@ icon_t* png_load(UINT8 *data, UINTN size);
 
 static const font_t *g_font = &jetbrains_font;
 
+/* partraschebestgirlever */
+
+static const unsigned char *g_glyph_cov = 0;
+static const font_t        *g_cov_for   = 0;
+
+static void font_ensure_decoded(void) {
+    if (g_cov_for == g_font && g_glyph_cov) return;
+    const font_t *f = g_font;
+    unsigned char *out = efi_allocate_pool(f->unpacked_size);
+    g_cov_for = f;
+    if (!out) { g_glyph_cov = 0; return; }
+
+    const unsigned char *in     = f->pixels;
+    const unsigned char *in_end = in + f->packed_size;
+    UINTN o = 0;
+    while (in < in_end && o < f->unpacked_size) {
+        signed char n = (signed char)*in++;
+        if (n >= 0) {
+            UINTN cnt = (UINTN)n + 1;
+            while (cnt-- && in < in_end && o < f->unpacked_size) out[o++] = *in++;
+        } else if (n != -128) {
+            if (in >= in_end) break;
+            UINTN cnt = (UINTN)(1 - (int)n);
+            unsigned char v = *in++;
+            while (cnt-- && o < f->unpacked_size) out[o++] = v;
+        }
+    }
+    g_glyph_cov = out;
+}
+
 void gui_set_font(const char *name) {
 
     (void)name;
@@ -59,6 +89,30 @@ void gui_present(gui_state_t *state) {
     for (UINTN y = 0; y < state->screen_height; y++) {
         UINT32 *dst = (UINT32*)(fb + y * state->pixels_per_scanline * sizeof(UINT32));
         UINT32 *src = &state->backbuffer[y * state->screen_width];
+        for (UINTN x = 0; x < state->screen_width; x++) dst[x] = src[x];
+    }
+}
+
+void gui_present_band(gui_state_t *state, INTN y, INTN h) {
+    if (!state->backbuffer) return;
+    if (y < 0) { h += y; y = 0; }
+    if (h <= 0) return;
+    if (y + h > (INTN)state->screen_height) h = (INTN)state->screen_height - y;
+    if (h <= 0) return;
+
+    EFI_STATUS s = uefi_call_wrapper(state->gop->Blt, 10,
+        state->gop,
+        (EFI_GRAPHICS_OUTPUT_BLT_PIXEL*)state->backbuffer,
+        EfiBltBufferToVideo,
+        0, (UINTN)y, 0, (UINTN)y,
+        state->screen_width, (UINTN)h,
+        state->screen_width * sizeof(UINT32));
+    if (!EFI_ERROR(s)) return;
+
+    UINT8 *fb = (UINT8*)state->gop->Mode->FrameBufferBase;
+    for (INTN row = y; row < y + h; row++) {
+        UINT32 *dst = (UINT32*)(fb + (UINTN)row * state->pixels_per_scanline * sizeof(UINT32));
+        UINT32 *src = &state->backbuffer[(UINTN)row * state->screen_width];
         for (UINTN x = 0; x < state->screen_width; x++) dst[x] = src[x];
     }
 }
@@ -113,6 +167,12 @@ EFI_STATUS gui_init(gui_state_t *state) {
     state->bg_color = COLOR_BLACK;
     state->fg_color = COLOR_WHITE;
     state->highlight_color = COLOR_BLUE;
+    state->blur = 0;
+    state->blur_title = 0;
+    state->blur_color = COLOR_WHITE;
+    state->anim_speed = 0;
+    state->anim_cross = 0;
+    state->anim_frames = 12;
 
     state->selected = 0;
     state->entries = NULL;
@@ -121,6 +181,20 @@ EFI_STATUS gui_init(gui_state_t *state) {
     state->timeout_active = 1;
     state->running = 1;
     state->action = VISOR_ACTION_BOOT;
+    state->focus = FOCUS_ENTRIES;
+    state->prev_focus = FOCUS_ENTRIES;
+    state->power_sel = 0;
+    for (int i = 0; i < 9; i++) { state->anim_cur[i] = state->anim_from[i] = state->anim_to[i] = 0; }
+    state->prev_box_y0 = 0;
+    state->prev_box_y1 = 0;
+    state->anim_frame = 0;
+    state->anim_active = 0;
+    state->anim_init = 0;
+    state->anim_power = 0;
+    state->band_n = 0;
+    state->band_y[0] = state->band_y[1] = 0;
+    state->band_h[0] = state->band_h[1] = 0;
+    state->prev_ul_y = 0;
     state->title = NULL;
     state->show_title = 1;
     state->title_color = COLOR_WHITE;
@@ -141,12 +215,23 @@ EFI_STATUS gui_init(gui_state_t *state) {
     state->reboot_color = COLOR_BLUE;
     state->firmware_color = COLOR_BLUE;
 
+    state->power_icons = 0;
+    state->power_icon_size = 0;
+    state->shutdown_icon = NULL;
+    state->reboot_icon = NULL;
+    state->firmware_icon = NULL;
+
     state->background = NULL;
     state->background_path = NULL;
 
     state->backbuffer = efi_allocate_pool(
         state->screen_width * state->screen_height * sizeof(UINT32));
     if (!state->backbuffer) return EFI_OUT_OF_RESOURCES;
+
+    state->scene_cache = efi_allocate_pool(
+        state->screen_width * state->screen_height * sizeof(UINT32));
+    state->blur_cache = NULL;
+    state->scene_valid = 0;
 
     gui_fill_rect(state, 0, 0, state->screen_width, state->screen_height, state->bg_color);
     gui_present(state);
@@ -193,22 +278,60 @@ static void fill_round_rect(gui_state_t *state, INTN x, INTN y, INTN w, INTN h,
     }
 }
 
-static void draw_image_sized(gui_state_t *state, icon_t *icon,
-                             UINTN x, UINTN y, UINTN size) {
+static void draw_image_sized_a(gui_state_t *state, icon_t *icon,
+                               UINTN x, UINTN y, UINTN size, INTN master) {
     if (!icon || !icon->pixels || icon->width == 0 || icon->height == 0 || size == 0)
         return;
+    if (master <= 0) return;
+    if (master > 255) master = 255;
 
+    UINTN iw = icon->width, ih = icon->height;
     for (UINTN j = 0; j < size && (y + j) < state->screen_height; j++) {
-        UINTN src_y = j * icon->height / size;
+        UINTN sy0 = j * ih / size;
+        UINTN sy1 = (j + 1) * ih / size;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > ih) sy1 = ih;
         for (UINTN i = 0; i < size && (x + i) < state->screen_width; i++) {
-            UINTN src_x = i * icon->width / size;
-            UINT32 pixel = icon->pixels[src_y * icon->width + src_x];
-            if (pixel & 0xFF000000) {
-                UINT32 *dest = get_pixel(state, x + i, y + j);
-                if (dest) *dest = pixel;
+            UINTN sx0 = i * iw / size;
+            UINTN sx1 = (i + 1) * iw / size;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > iw) sx1 = iw;
+
+            UINT32 ar = 0, ag = 0, ab = 0, aa = 0, n = 0;
+            for (UINTN sy = sy0; sy < sy1; sy++) {
+                const UINT32 *row = icon->pixels + sy * iw;
+                for (UINTN sx = sx0; sx < sx1; sx++) {
+                    UINT32 p = row[sx];
+                    UINT32 a = (p >> 24) & 0xFF;
+                    ar += ((p >> 16) & 0xFF) * a;
+                    ag += ((p >> 8) & 0xFF) * a;
+                    ab += (p & 0xFF) * a;
+                    aa += a;
+                    n++;
+                }
             }
+            if (n == 0) continue;
+            UINTN cov = aa / n;
+            cov = cov * (UINTN)master / 255;
+            if (cov == 0) continue;
+            UINT8 sr, sg, sb;
+            if (aa == 0) { sr = sg = sb = 0; }
+            else { sr = (UINT8)(ar / aa); sg = (UINT8)(ag / aa); sb = (UINT8)(ab / aa); }
+
+            UINT32 *dest = get_pixel(state, x + i, y + j);
+            if (!dest) continue;
+            UINT8 br = (*dest >> 16) & 0xFF, bg = (*dest >> 8) & 0xFF, bb = *dest & 0xFF;
+            UINT8 nr = (UINT8)((sr * cov + br * (255 - cov)) / 255);
+            UINT8 ng = (UINT8)((sg * cov + bg * (255 - cov)) / 255);
+            UINT8 nb = (UINT8)((sb * cov + bb * (255 - cov)) / 255);
+            *dest = (0xFFu << 24) | (nr << 16) | (ng << 8) | nb;
         }
     }
+}
+
+static void draw_image_sized(gui_state_t *state, icon_t *icon,
+                             UINTN x, UINTN y, UINTN size) {
+    draw_image_sized_a(state, icon, x, y, size, 255);
 }
 
 void gui_draw_image(gui_state_t *state, icon_t *icon, UINTN x, UINTN y) {
@@ -235,7 +358,8 @@ static UINT8 sample_cov(const unsigned char *cov, UINTN w, UINTN h,
 static UINTN blend_glyph(gui_state_t *state, const glyph_t *g, UINT32 rgb,
                          INTN dx, INTN dyTop, UINTN size_px, UINTN dh) {
     if (g->w == 0 || g->h == 0) return g->advance * dh / size_px;
-    const unsigned char *cov = g_font->pixels + g->pixel_offset;
+    if (!g_glyph_cov) return g->advance * dh / size_px;
+    const unsigned char *cov = g_glyph_cov + g->pixel_offset;
     UINTN dw = (UINTN)g->w * dh / size_px;
     UINTN ddh = (UINTN)g->h * dh / size_px;
     if (dw == 0 || ddh == 0) return g->advance * dh / size_px;
@@ -278,6 +402,7 @@ static UINTN text_width_px(CHAR16 *text, UINTN dh) {
 static void draw_text_px(gui_state_t *state, CHAR16 *text, UINTN x, UINTN y,
                          color_t color, UINTN dh) {
     if (!text) return;
+    font_ensure_decoded();
     UINT32 rgb = color_to_u32(color) & 0x00FFFFFF;
     UINTN size = g_font->size;
     UINTN baseline = y + (UINTN)g_font->ascent * dh / size;
@@ -443,106 +568,461 @@ static const struct { CHAR16 *label; int action; } POWER_ACTIONS[] = {
 };
 #define POWER_ACTION_COUNT 3
 
-static void draw_power_actions(gui_state_t *state) {
-    UINTN scale   = 2;
-    UINTN line_h  = 8 * scale + 12;
+#define POWER_SCALE 2
+
+static void layout_power(gui_state_t *state) {
+    UINTN scale   = POWER_SCALE;
+    UINTN th      = px_height(scale);
+    UINTN line_h  = th + 18;
     UINTN margin  = 30;
-    UINTN block_h = POWER_ACTION_COUNT * line_h;
+
+    icon_t *icon[POWER_ACTION_COUNT] = {
+        state->shutdown_icon, state->reboot_icon, state->firmware_icon
+    };
+    UINTN isz       = state->power_icon_size ? state->power_icon_size : 40;
+    UINTN icon_line = isz + 16;
+
+    UINTN block_h = 0;
+    for (UINTN i = 0; i < POWER_ACTION_COUNT; i++)
+        block_h += (state->power_icons && icon[i]) ? icon_line : line_h;
 
     int right_side = (state->power_position == POWER_POS_BOTTOMRIGHT ||
                       state->power_position == POWER_POS_TOPRIGHT);
     int top_side   = (state->power_position == POWER_POS_TOPRIGHT ||
                       state->power_position == POWER_POS_TOPLEFT);
 
-    UINTN top = top_side ? margin : (state->screen_height - margin - block_h);
+    INTN top = top_side ? (INTN)margin
+                        : (INTN)(state->screen_height - margin - block_h);
+    INTN y = top;
 
-    color_t dim = { 0xC0, 0xC0, 0xC8 };
+    for (UINTN i = 0; i < POWER_ACTION_COUNT; i++) {
+        if (state->power_icons && icon[i]) {
+            INTN x = right_side ? (INTN)(state->screen_width - margin - isz) : (INTN)margin;
+            state->pwr_x[i] = x; state->pwr_y[i] = y;
+            state->pwr_w[i] = (INTN)isz; state->pwr_h[i] = (INTN)isz;
+            y += icon_line;
+        } else {
+            UINTN tw = text_width(POWER_ACTIONS[i].label, scale);
+            INTN  x  = right_side ? (INTN)(state->screen_width - margin - tw) : (INTN)margin;
+            state->pwr_x[i] = x; state->pwr_y[i] = y;
+            state->pwr_w[i] = (INTN)tw; state->pwr_h[i] = (INTN)th;
+            y += line_h;
+        }
+    }
+    state->pwr_y0 = top;
+    state->pwr_y1 = top + (INTN)block_h;
+}
+
+static void draw_power_actions(gui_state_t *state, int focus_idx) {
+    UINTN scale = POWER_SCALE;
+    icon_t *icon[POWER_ACTION_COUNT] = {
+        state->shutdown_icon, state->reboot_icon, state->firmware_icon
+    };
     color_t key_color[POWER_ACTION_COUNT] = {
         state->shutdown_color, state->reboot_color, state->firmware_color
     };
+    color_t dim = { 0xC0, 0xC0, 0xC8 };
 
     for (UINTN i = 0; i < POWER_ACTION_COUNT; i++) {
-        CHAR16 *label = POWER_ACTIONS[i].label;
-        UINTN  tw = text_width(label, scale);
-        UINTN  x  = right_side ? (state->screen_width - margin - tw) : margin;
-        UINTN  y  = top + i * line_h;
+        int focused = ((int)i == focus_idx);
+        if (state->power_icons && icon[i]) {
+            draw_image_sized(state, icon[i], state->pwr_x[i], state->pwr_y[i],
+                             (UINTN)state->pwr_w[i]);
+        } else {
+            CHAR16 *label = POWER_ACTIONS[i].label;
+            INTN x = state->pwr_x[i], y = state->pwr_y[i];
 
-        CHAR16 first[2] = { label[0], 0 };
-        draw_text_scaled(state, first, x, y, key_color[i], scale);
-        draw_text_scaled(state, label + 1, x + (8 + 2) * scale, y, dim, scale);
+            CHAR16 first[2] = { label[0], 0 };
+            draw_text_scaled(state, first, x, y, key_color[i], scale);
+            draw_text_scaled(state, label + 1, x + (8 + 2) * scale, y,
+                             focused ? key_color[i] : dim, scale);
+        }
     }
 }
 
-void gui_draw_menu(gui_state_t *state) {
+static void scene_restore_band(gui_state_t *state, INTN y, INTN h) {
+    if (!state->scene_cache) return;
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > (INTN)state->screen_height) h = (INTN)state->screen_height - y;
+    UINTN W = state->screen_width;
+    for (INTN row = y; row < y + h; row++) {
+        UINT32 *d = state->backbuffer + (UINTN)row * W;
+        UINT32 *s = state->scene_cache + (UINTN)row * W;
+        for (UINTN i = 0; i < W; i++) d[i] = s[i];
+    }
+}
 
-    gui_draw_background(state);
+#define A_CARDX 0
+#define A_CARDA 1
+#define A_ULX   2
+#define A_ULY   3
+#define A_ULW   4
+#define A_BOXX  5
+#define A_BOXY  6
+#define A_BOXW  7
+#define A_BOXH  8
 
-    fill_rect_alpha(state, 0, 0, state->screen_width, state->screen_height,
-                    COLOR_BLACK, 60);
+#define FROST_RADIUS 16
 
-    if (state->show_title) {
-        CHAR16 *title = (state->title && state->title[0]) ? state->title : L"Visor";
-        UINTN title_px = state->title_size ? state->title_size
-                                           : state->screen_height / 12;
-        UINTN tw = text_width_px(title, title_px);
-        UINTN tx = (tw < state->screen_width) ? (state->screen_width - tw) / 2 : 0;
-        draw_text_px(state, title, tx, state->screen_height / 14,
-                     state->title_color, title_px);
+static void box_blur_pass(gui_state_t *state, UINT32 *src, UINT32 *dst, INTN rad) {
+    UINTN W = state->screen_width, H = state->screen_height;
+    for (UINTN y = 0; y < H; y++) {
+        UINT32 *s = src + y * W;
+        UINT32 *d = dst + y * W;
+        UINT32 sr = 0, sg = 0, sb = 0;
+        INTN win = 2 * rad + 1;
+        for (INTN i = -rad; i <= rad; i++) {
+            UINTN xi = (i < 0) ? 0 : ((UINTN)i >= W ? W - 1 : (UINTN)i);
+            UINT32 p = s[xi];
+            sr += (p >> 16) & 0xFF; sg += (p >> 8) & 0xFF; sb += p & 0xFF;
+        }
+        for (UINTN x = 0; x < W; x++) {
+            d[x] = (0xFFu << 24) | (((sr / win) & 0xFF) << 16)
+                 | (((sg / win) & 0xFF) << 8) | ((sb / win) & 0xFF);
+            UINTN xa = x + rad + 1; if (xa >= W) xa = W - 1;
+            INTN xrm = (INTN)x - rad; UINTN xr = (xrm < 0) ? 0 : (UINTN)xrm;
+            UINT32 pa = s[xa], pr = s[xr];
+            sr += ((pa >> 16) & 0xFF) - ((pr >> 16) & 0xFF);
+            sg += ((pa >> 8) & 0xFF) - ((pr >> 8) & 0xFF);
+            sb += (pa & 0xFF) - (pr & 0xFF);
+        }
+    }
+}
+
+static void box_blur_vpass(gui_state_t *state, UINT32 *src, UINT32 *dst, INTN rad) {
+    UINTN W = state->screen_width, H = state->screen_height;
+    for (UINTN x = 0; x < W; x++) {
+        UINT32 sr = 0, sg = 0, sb = 0;
+        INTN win = 2 * rad + 1;
+        for (INTN i = -rad; i <= rad; i++) {
+            UINTN yi = (i < 0) ? 0 : ((UINTN)i >= H ? H - 1 : (UINTN)i);
+            UINT32 p = src[yi * W + x];
+            sr += (p >> 16) & 0xFF; sg += (p >> 8) & 0xFF; sb += p & 0xFF;
+        }
+        for (UINTN y = 0; y < H; y++) {
+            dst[y * W + x] = (0xFFu << 24) | (((sr / win) & 0xFF) << 16)
+                           | (((sg / win) & 0xFF) << 8) | ((sb / win) & 0xFF);
+            UINTN ya = y + rad + 1; if (ya >= H) ya = H - 1;
+            INTN yrm = (INTN)y - rad; UINTN yr = (yrm < 0) ? 0 : (UINTN)yrm;
+            UINT32 pa = src[ya * W + x], pr = src[yr * W + x];
+            sr += ((pa >> 16) & 0xFF) - ((pr >> 16) & 0xFF);
+            sg += ((pa >> 8) & 0xFF) - ((pr >> 8) & 0xFF);
+            sb += (pa & 0xFF) - (pr & 0xFF);
+        }
+    }
+}
+
+static void build_blur_cache(gui_state_t *state) {
+    if (!state->blur_cache) {
+        state->blur_cache = efi_allocate_pool(
+            state->screen_width * state->screen_height * sizeof(UINT32));
+    }
+    if (!state->blur_cache || !state->scene_cache) return;
+    box_blur_pass(state, state->backbuffer, state->scene_cache, 14);
+    box_blur_vpass(state, state->scene_cache, state->blur_cache, 14);
+    box_blur_pass(state, state->blur_cache, state->scene_cache, 14);
+    box_blur_vpass(state, state->scene_cache, state->blur_cache, 14);
+}
+
+static void draw_frost(gui_state_t *state, INTN x, INTN y, INTN w, INTN h, INTN a) {
+    if (a <= 0 || w <= 0 || h <= 0) return;
+    if (a > 255) a = 255;
+    int clear = (state->blur == 2);
+    color_t tint = state->blur_color;
+    INTN r = FROST_RADIUS;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+
+    UINTN W = state->screen_width;
+    INTN base_fill = clear ? (a * 255 / 255) : (a * 220 / 255);
+    INTN tint_a = clear ? 0 : 34;
+    INTN lift   = clear ? 0 : 8;
+    INTN feather = 10;
+    for (INTN j = 0; j < h; j++) {
+        INTN inset = 0;
+        if (j < r)            { INTN dy = r - 1 - j; INTN q = r*r - dy*dy; inset = r - (INTN)isqrt_(q > 0 ? q : 0); }
+        else if (j >= h - r)  { INTN dy = j - (h - r); INTN q = r*r - dy*dy; inset = r - (INTN)isqrt_(q > 0 ? q : 0); }
+        INTN yy = y + j;
+        if (yy < 0 || yy >= (INTN)state->screen_height) continue;
+        INTN edy = (j < h - 1 - j) ? j : (h - 1 - j);
+        for (INTN i = inset; i < w - inset; i++) {
+            INTN xx = x + i;
+            UINT32 *p = get_pixel(state, xx, yy);
+            if (!p) continue;
+            INTN edx = (i - inset < (w - inset - 1) - i) ? (i - inset) : ((w - inset - 1) - i);
+            INTN ed = (edx < edy) ? edx : edy;
+            INTN fill_a = base_fill;
+            if (ed < feather) fill_a = base_fill * ed / feather;
+            if (fill_a <= 0) continue;
+            UINT32 src;
+            if (state->blur_cache) src = state->blur_cache[(UINTN)yy * W + (UINTN)xx];
+            else                   src = color_to_u32(state->bg_color);
+            INTN sr = (src >> 16) & 0xFF, sg = (src >> 8) & 0xFF, sb = src & 0xFF;
+            sr += lift; sg += lift; sb += lift;
+            sr = (sr * (255 - tint_a) + tint.r * tint_a) / 255;
+            sg = (sg * (255 - tint_a) + tint.g * tint_a) / 255;
+            sb = (sb * (255 - tint_a) + tint.b * tint_a) / 255;
+            if (sr > 255) sr = 255;
+            if (sg > 255) sg = 255;
+            if (sb > 255) sb = 255;
+            UINT8 br = (*p >> 16) & 0xFF, bgc = (*p >> 8) & 0xFF, bb = *p & 0xFF;
+            UINT8 nr = (UINT8)((sr * fill_a + br * (255 - fill_a)) / 255);
+            UINT8 ng = (UINT8)((sg * fill_a + bgc * (255 - fill_a)) / 255);
+            UINT8 nb = (UINT8)((sb * fill_a + bb * (255 - fill_a)) / 255);
+            *p = (0xFFu << 24) | (nr << 16) | (ng << 8) | nb;
+        }
+    }
+}
+
+void gui_draw_menu(gui_state_t *state, int partial) {
+
+    layout_power(state);
+
+    UINTN px = state->screen_width * state->screen_height;
+    int building = (!state->scene_cache) || (!state->scene_valid);
+    if (building) {
+        gui_draw_background(state);
+        fill_rect_alpha(state, 0, 0, state->screen_width, state->screen_height,
+                        COLOR_BLACK, 60);
+
+        if (state->blur || state->blur_title)
+            build_blur_cache(state);
+
+        if (state->show_title) {
+            CHAR16 *title = (state->title && state->title[0]) ? state->title : L"Visor";
+            UINTN title_px = state->title_size ? state->title_size
+                                               : state->screen_height / 12;
+            UINTN tw = text_width_px(title, title_px);
+            UINTN tx = (tw < state->screen_width) ? (state->screen_width - tw) / 2 : 0;
+            UINTN ty = state->screen_height / 14;
+            if (state->blur_title) {
+                INTN pad = 18;
+                draw_frost(state, (INTN)tx - pad, (INTN)ty - pad,
+                           (INTN)tw + 2 * pad, (INTN)title_px + 2 * pad, 255);
+            }
+            draw_text_px(state, title, tx, ty, state->title_color, title_px);
+        }
+
+        draw_power_actions(state, -1);
+
+        if (state->scene_cache) {
+            for (UINTN i = 0; i < px; i++) state->scene_cache[i] = state->backbuffer[i];
+            state->scene_valid = 1;
+        }
+    } else if (partial) {
+        for (int b = 0; b < state->band_n; b++)
+            scene_restore_band(state, state->band_y[b], state->band_h[b]);
+    } else {
+        for (UINTN i = 0; i < px; i++) state->backbuffer[i] = state->scene_cache[i];
     }
 
     if (state->entry_count == 0) {
         CHAR16 msg[] = L"No boot entries found";
         draw_text_centered(state, msg, 0, state->screen_width,
                            state->screen_height / 2, state->fg_color, 2);
-        draw_power_actions(state);
+        draw_power_actions(state, state->focus == FOCUS_POWER ? (int)state->power_sel : -1);
         return;
     }
 
     UINTN is      = state->icon_size    ? state->icon_size    : ICON_SIZE;
     UINTN isp     = state->icon_spacing ? state->icon_spacing : ICON_SPACING + 40;
-    UINTN slot    = is + isp;
-    UINTN row_w   = state->entry_count * slot - (slot - is);
-    UINTN start_x = (state->screen_width > row_w) ? (state->screen_width - row_w) / 2 : 0;
+
+    UINTN total_w = 0, max_ei = is, sel_ei = is;
+    INTN  sel_left = 0;
+    {
+        UINTN x = 0;
+        boot_entry_t *e = state->entries;
+        for (UINTN i = 0; i < state->entry_count; i++) {
+            UINTN ei = e->icon_size ? e->icon_size : is;
+            if (ei > max_ei) max_ei = ei;
+            total_w += ei + (i + 1 < state->entry_count ? isp : 0);
+            x += (i ? isp : 0);
+            if (i == state->selected) { sel_left = (INTN)x; sel_ei = ei; }
+            x += ei;
+            e = e->next;
+        }
+    }
+
+    UINTN start_x = (state->screen_width > total_w) ? (state->screen_width - total_w) / 2 : 0;
+    sel_left += (INTN)start_x;
+
     UINTN icon_cy = state->icon_y ? state->icon_y : state->screen_height / 2;
-    UINTN icon_y  = (icon_cy > is / 2) ? icon_cy - is / 2 : 0;
+    UINTN row_top = (icon_cy > max_ei / 2) ? icon_cy - max_ei / 2 : 0;
 
     UINTN name_px = state->name_size ? state->name_size : 16;
     UINTN ul_th   = state->underline_thickness ? state->underline_thickness : 4;
     INTN  pad     = 16;
-    UINTN ul_y    = icon_y + is + 10;
+    UINTN ul_y    = row_top + max_ei + 10;
     UINTN name_y  = ul_y + ul_th + 8;
+    UINTN ul_len  = state->underline_length ? state->underline_length
+                                            : (sel_ei + 2 * pad - 20);
+
+    INTN sel_top  = (INTN)icon_cy - (INTN)sel_ei / 2;
+    INTN ecard_top = sel_top - pad;
+    INTN ecard_bot = (INTN)name_y + (INTN)name_px + pad / 2;
+
+    INTN tgt[9];
+    tgt[A_CARDX] = sel_left;
+    tgt[A_CARDA] = (state->focus == FOCUS_ENTRIES) ? 38 : 0;
+    if (state->focus == FOCUS_POWER) {
+        UINTN ps = state->power_sel;
+        tgt[A_ULX] = state->pwr_x[ps];
+        tgt[A_ULY] = state->pwr_y[ps] + state->pwr_h[ps] + 4;
+        tgt[A_ULW] = state->pwr_w[ps];
+        INTN bpad = 10;
+        tgt[A_BOXX] = state->pwr_x[ps] - bpad;
+        tgt[A_BOXY] = state->pwr_y[ps] - bpad;
+        tgt[A_BOXW] = state->pwr_w[ps] + 2 * bpad;
+        tgt[A_BOXH] = state->pwr_h[ps] + 2 * bpad;
+    } else {
+        tgt[A_ULX] = sel_left + (INTN)sel_ei / 2 - (INTN)ul_len / 2;
+        tgt[A_ULY] = (INTN)ul_y;
+        tgt[A_ULW] = (INTN)ul_len;
+        tgt[A_BOXX] = sel_left - pad;
+        tgt[A_BOXY] = ecard_top;
+        tgt[A_BOXW] = (INTN)sel_ei + 2 * pad;
+        tgt[A_BOXH] = ecard_bot - ecard_top;
+    }
+
+    int N = state->anim_frames; if (N < 2) N = 2;
+
+    if (!state->anim_init) {
+        for (int k = 0; k < 9; k++) state->anim_cur[k] = state->anim_to[k] = tgt[k];
+        state->anim_init = 1;
+        state->anim_active = 0;
+        state->anim_cross = 0;
+    } else {
+        int changed = 0;
+        for (int k = 0; k < 9; k++) if (tgt[k] != state->anim_to[k]) changed = 1;
+        if (changed) {
+            for (int k = 0; k < 9; k++) {
+                state->anim_from[k] = state->anim_cur[k];
+                state->anim_to[k]   = tgt[k];
+            }
+            state->anim_frame  = 0;
+            state->anim_active = 1;
+            int zc = ((state->focus == FOCUS_POWER) != (state->prev_focus == FOCUS_POWER));
+            state->anim_cross = state->blur ? zc : 0;
+        }
+    }
+    if (state->anim_active) {
+        state->anim_frame++;
+        if (state->anim_frame >= N) {
+            for (int k = 0; k < 9; k++) state->anim_cur[k] = state->anim_to[k];
+            state->anim_active = 0;
+            state->anim_cross = 0;
+        } else if (!state->anim_cross) {
+            INTN t = state->anim_frame * 1000 / N;
+            INTN e = (t < 500)
+                   ? (2 * t * t) / 1000
+                   : 1000 - ((2000 - 2 * t) * (2000 - 2 * t)) / 2000;
+            for (int k = 0; k < 9; k++)
+                state->anim_cur[k] = state->anim_from[k]
+                                   + (state->anim_to[k] - state->anim_from[k]) * e / 1000;
+        }
+    }
+
+    int cross = state->anim_active && state->anim_cross;
+    INTN fin = cross ? (state->anim_frame * 255 / N) : 255;
+    INTN fout = 255 - fin;
+
+    INTN ilo[5], ihi[5]; int ni = 0;
+    ilo[ni] = (INTN)row_top - pad - 2;
+    ihi[ni] = (INTN)(name_y + name_px + pad) + 2; ni++;
+
+    if (cross) {
+        ilo[ni] = state->anim_from[A_BOXY] - 6;
+        ihi[ni] = state->anim_from[A_BOXY] + state->anim_from[A_BOXH] + 6; ni++;
+        ilo[ni] = state->anim_to[A_BOXY] - 6;
+        ihi[ni] = state->anim_to[A_BOXY] + state->anim_to[A_BOXH] + 6; ni++;
+    } else {
+        if (state->blur) {
+            INTN cb0 = state->anim_cur[A_BOXY] - 6;
+            INTN cb1 = state->anim_cur[A_BOXY] + state->anim_cur[A_BOXH] + 6;
+            if (state->prev_box_y0 < cb0) cb0 = state->prev_box_y0;
+            if (state->prev_box_y1 > cb1) cb1 = state->prev_box_y1;
+            ilo[ni] = cb0; ihi[ni] = cb1; ni++;
+        }
+        INTN uy = state->anim_cur[A_ULY];
+        INTN ulo = (uy < state->prev_ul_y) ? uy : state->prev_ul_y;
+        INTN uhi = (uy > state->prev_ul_y) ? uy : state->prev_ul_y;
+        ilo[ni] = ulo - 4; ihi[ni] = uhi + (INTN)ul_th + 6; ni++;
+        if (state->focus == FOCUS_POWER || state->prev_focus == FOCUS_POWER) {
+            ilo[ni] = state->pwr_y0 - 6; ihi[ni] = state->pwr_y1 + 6; ni++;
+        }
+    }
+
+    state->prev_ul_y = state->anim_cur[A_ULY];
+    state->prev_box_y0 = state->anim_cur[A_BOXY] - 6;
+    state->prev_box_y1 = state->anim_cur[A_BOXY] + state->anim_cur[A_BOXH] + 6;
+
+    for (int a = 0; a < ni; a++)
+        for (int b = a + 1; b < ni; b++)
+            if (ilo[b] < ilo[a]) { INTN t0 = ilo[a]; ilo[a] = ilo[b]; ilo[b] = t0;
+                                   INTN t1 = ihi[a]; ihi[a] = ihi[b]; ihi[b] = t1; }
+    INTN bl[5], bh[5]; int nb = 0;
+    for (int a = 0; a < ni; a++) {
+        if (nb && ilo[a] <= bh[nb - 1] + 2) {
+            if (ihi[a] > bh[nb - 1]) bh[nb - 1] = ihi[a];
+        } else { bl[nb] = ilo[a]; bh[nb] = ihi[a]; nb++; }
+    }
+    if (nb > 2) { bh[0] = bh[nb - 1]; nb = 1; }
+    state->band_n = nb;
+    for (int a = 0; a < nb; a++) { state->band_y[a] = bl[a]; state->band_h[a] = bh[a] - bl[a]; }
+
+    int pfocus = (state->focus == FOCUS_POWER) ? (int)state->power_sel : -1;
+
+    UINTN ul_rad = ul_th / 2; if (ul_rad > 2) ul_rad = 2;
+    if (state->blur) {
+        if (cross) {
+            draw_frost(state, state->anim_from[A_BOXX], state->anim_from[A_BOXY],
+                       state->anim_from[A_BOXW], state->anim_from[A_BOXH], fout);
+            draw_frost(state, state->anim_to[A_BOXX], state->anim_to[A_BOXY],
+                       state->anim_to[A_BOXW], state->anim_to[A_BOXH], fin);
+            fill_round_rect(state, state->anim_from[A_ULX], state->anim_from[A_ULY],
+                            state->anim_from[A_ULW], (INTN)ul_th, (INTN)ul_rad,
+                            state->underline_color, (UINT8)(230 * fout / 255));
+            fill_round_rect(state, state->anim_to[A_ULX], state->anim_to[A_ULY],
+                            state->anim_to[A_ULW], (INTN)ul_th, (INTN)ul_rad,
+                            state->underline_color, (UINT8)(230 * fin / 255));
+        } else {
+            draw_frost(state, state->anim_cur[A_BOXX], state->anim_cur[A_BOXY],
+                       state->anim_cur[A_BOXW], state->anim_cur[A_BOXH], 255);
+            fill_round_rect(state, state->anim_cur[A_ULX], state->anim_cur[A_ULY],
+                            state->anim_cur[A_ULW], (INTN)ul_th, (INTN)ul_rad,
+                            state->underline_color, 230);
+        }
+    } else {
+        INTN carda = state->anim_cur[A_CARDA];
+        if (carda > 0) {
+            INTN cx = state->anim_cur[A_CARDX];
+            fill_round_rect(state, cx - pad, ecard_top,
+                            sel_ei + 2 * pad, ecard_bot - ecard_top,
+                            14, COLOR_WHITE, (UINT8)carda);
+        }
+        fill_round_rect(state, state->anim_cur[A_ULX], state->anim_cur[A_ULY],
+                        state->anim_cur[A_ULW], (INTN)ul_th, (INTN)ul_rad,
+                        state->underline_color, 230);
+    }
 
     boot_entry_t *entry = state->entries;
+    UINTN x = start_x;
     for (UINTN i = 0; i < state->entry_count; i++) {
-        UINTN x = start_x + i * slot;
-
-        if (i == state->selected) {
-            INTN card_top = (INTN)icon_y - pad;
-            INTN card_bot = (INTN)name_y + (INTN)name_px + pad / 2;
-            fill_round_rect(state, (INTN)x - pad, card_top,
-                            is + 2 * pad, card_bot - card_top,
-                            14, COLOR_WHITE, 38);
-
-            UINTN ul_len = state->underline_length ? state->underline_length
-                                                   : (is + 2 * pad - 20);
-            INTN  ul_x   = (INTN)x + (INTN)is / 2 - (INTN)ul_len / 2;
-            UINTN ul_rad = ul_th / 2; if (ul_rad > 2) ul_rad = 2;
-            fill_round_rect(state, ul_x, (INTN)ul_y, (INTN)ul_len, (INTN)ul_th,
-                            (INTN)ul_rad, state->underline_color, 230);
-        }
+        UINTN ei = entry->icon_size ? entry->icon_size : is;
+        UINTN iy = (icon_cy > ei / 2) ? icon_cy - ei / 2 : 0;
 
         if (entry->icon) {
-            draw_image_sized(state, entry->icon, x, icon_y, is);
+            draw_image_sized(state, entry->icon, x, iy, ei);
         } else {
             color_t placeholder = entry->type == 0 ? COLOR_GREEN : COLOR_RED;
-            fill_round_rect(state, (INTN)x, (INTN)icon_y, is, is,
+            fill_round_rect(state, (INTN)x, (INTN)iy, ei, ei,
                             12, placeholder, 255);
         }
 
         color_t name_col;
         if (entry->has_color) {
             name_col = entry->color;
-        } else if (i == state->selected) {
+        } else if (i == state->selected && state->focus == FOCUS_ENTRIES) {
             name_col = state->name_color;
         } else {
             name_col = (color_t){ state->name_color.r * 7 / 10,
@@ -550,13 +1030,35 @@ void gui_draw_menu(gui_state_t *state) {
                                   state->name_color.b * 7 / 10 };
         }
         UINTN nw = text_width_px(entry->name, name_px);
-        UINTN nx = (INTN)x + (INTN)is / 2 - (INTN)nw / 2;
+        INTN  nx = (INTN)x + (INTN)ei / 2 - (INTN)nw / 2;
         draw_text_px(state, entry->name, nx, name_y, name_col, name_px);
 
+        x += ei + isp;
         entry = entry->next;
     }
 
-    draw_power_actions(state);
+    if (pfocus >= 0) {
+        if (state->power_icons && (pfocus == 0 ? state->shutdown_icon :
+                                   pfocus == 1 ? state->reboot_icon :
+                                                 state->firmware_icon)) {
+            icon_t *ic = pfocus == 0 ? state->shutdown_icon :
+                         pfocus == 1 ? state->reboot_icon : state->firmware_icon;
+            draw_image_sized(state, ic, state->pwr_x[pfocus], state->pwr_y[pfocus],
+                             (UINTN)state->pwr_w[pfocus]);
+        } else {
+            color_t kc = pfocus == 0 ? state->shutdown_color :
+                         pfocus == 1 ? state->reboot_color : state->firmware_color;
+            CHAR16 *label = POWER_ACTIONS[pfocus].label;
+            INTN lx = state->pwr_x[pfocus], ly = state->pwr_y[pfocus];
+            CHAR16 first[2] = { label[0], 0 };
+            draw_text_scaled(state, first, lx, ly, kc, POWER_SCALE);
+            draw_text_scaled(state, label + 1, lx + (8 + 2) * POWER_SCALE, ly, kc, POWER_SCALE);
+        }
+    }
+
+    state->prev_focus = state->focus;
+
+    if (partial) return;
 
     if (state->timeout_active && state->timeout > 0) {
         UINT64 elapsed = efi_get_tick() - state->timeout_start;
@@ -586,18 +1088,24 @@ boot_entry_t* gui_run(gui_state_t *state) {
 
     INTN last_remaining = -2;
     int  need_redraw = 1;
+    int  full_redraw = 1;
 
     while (state->running) {
         if (need_redraw) {
-            gui_draw_menu(state);
-            gui_present(state);
-            need_redraw = 0;
+            gui_draw_menu(state, !full_redraw);
+            if (full_redraw)
+                gui_present(state);
+            else
+                for (int b = 0; b < state->band_n; b++)
+                    gui_present_band(state, state->band_y[b], state->band_h[b]);
+            need_redraw = state->anim_active;
+            full_redraw = 0;
         }
 
         status = ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
         if (!EFI_ERROR(status)) {
 
-            if (state->timeout_active) { state->timeout_active = 0; need_redraw = 1; }
+            if (state->timeout_active) { state->timeout_active = 0; need_redraw = 1; full_redraw = 1; }
 
             CHAR16 uc = key.UnicodeChar;
             if (uc >= 'a' && uc <= 'z') uc -= 32;
@@ -605,19 +1113,60 @@ boot_entry_t* gui_run(gui_state_t *state) {
             if (uc == 'S') { state->action = VISOR_ACTION_SHUTDOWN; state->running = 0; }
             else if (uc == 'R') { state->action = VISOR_ACTION_REBOOT; state->running = 0; }
             else if (uc == 'F') { state->action = VISOR_ACTION_FIRMWARE; state->running = 0; }
-            else if (key.UnicodeChar == 0x0D) { state->running = 0; }
+            else if (key.UnicodeChar == 0x0D) {
+
+                if (state->focus == FOCUS_POWER)
+                    state->action = VISOR_ACTION_SHUTDOWN + (int)state->power_sel;
+                state->running = 0;
+            }
             else if (key.UnicodeChar == 0x00) {
+                int power_top = (state->power_position == POWER_POS_TOPLEFT ||
+                                 state->power_position == POWER_POS_TOPRIGHT);
                 switch (key.ScanCode) {
-                    case 0x01:
                     case 0x04:
+                        state->focus = FOCUS_ENTRIES;
                         if (state->selected > 0) state->selected--;
                         else state->selected = state->entry_count - 1;
                         need_redraw = 1;
                         break;
-                    case 0x02:
                     case 0x03:
+                        state->focus = FOCUS_ENTRIES;
                         if (state->selected < state->entry_count - 1) state->selected++;
                         else state->selected = 0;
+                        need_redraw = 1;
+                        break;
+                    case 0x02:
+                        if (power_top) {
+                            if (state->focus == FOCUS_POWER) {
+                                if (state->power_sel < POWER_ACTION_COUNT - 1)
+                                    state->power_sel++;
+                                else
+                                    state->focus = FOCUS_ENTRIES;
+                            }
+                        } else {
+                            if (state->focus == FOCUS_ENTRIES) {
+                                state->focus = FOCUS_POWER;
+                                state->power_sel = 0;
+                            } else if (state->power_sel < POWER_ACTION_COUNT - 1) {
+                                state->power_sel++;
+                            }
+                        }
+                        need_redraw = 1;
+                        break;
+                    case 0x01:
+                        if (power_top) {
+                            if (state->focus == FOCUS_ENTRIES) {
+                                state->focus = FOCUS_POWER;
+                                state->power_sel = POWER_ACTION_COUNT - 1;
+                            } else if (state->power_sel > 0) {
+                                state->power_sel--;
+                            }
+                        } else {
+                            if (state->focus == FOCUS_POWER) {
+                                if (state->power_sel > 0) state->power_sel--;
+                                else state->focus = FOCUS_ENTRIES;
+                            }
+                        }
                         need_redraw = 1;
                         break;
                     case 0x17:
@@ -627,7 +1176,11 @@ boot_entry_t* gui_run(gui_state_t *state) {
             }
             else if (key.UnicodeChar >= '1' && key.UnicodeChar <= '9') {
                 UINTN idx = key.UnicodeChar - '1';
-                if (idx < state->entry_count) { state->selected = idx; state->running = 0; }
+                if (idx < state->entry_count) {
+                    state->focus = FOCUS_ENTRIES;
+                    state->selected = idx;
+                    state->running = 0;
+                }
             }
         }
 
@@ -639,10 +1192,11 @@ boot_entry_t* gui_run(gui_state_t *state) {
             } else if (remaining != last_remaining) {
                 last_remaining = remaining;
                 need_redraw = 1;
+                full_redraw = 1;
             }
         }
 
-        efi_sleep(30);
+        efi_sleep(state->anim_active ? 6 : 30);
     }
 
     if (state->action != VISOR_ACTION_BOOT) return NULL;
@@ -679,5 +1233,13 @@ void gui_shutdown(gui_state_t *state) {
     if (state->backbuffer) {
         efi_free_pool(state->backbuffer);
         state->backbuffer = NULL;
+    }
+    if (state->scene_cache) {
+        efi_free_pool(state->scene_cache);
+        state->scene_cache = NULL;
+    }
+    if (state->blur_cache) {
+        efi_free_pool(state->blur_cache);
+        state->blur_cache = NULL;
     }
 }
