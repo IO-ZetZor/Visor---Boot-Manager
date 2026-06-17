@@ -77,6 +77,15 @@ typedef struct {
     UINTN entry_count;
 
     UINTN selected;
+
+    UINTN per_page;
+    UINTN prev_page;
+    UINTN prev_selected;
+    int   page_anim;
+    int   page_frame;
+    UINTN page_old;
+    UINTN page_old_sel;
+
     INTN  timeout;
     UINT64 timeout_start;
     int   timeout_active;
