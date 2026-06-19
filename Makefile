@@ -30,7 +30,7 @@ EFI_LDFLAGS = -nostdlib -znocombreloc -z notext -T $(LDS) -shared \
               $(CRT0) -lefi -lgnuefi
 
 SRCS = main.c efi_helpers.c gui.c config.c linux_boot.c windows_boot.c \
-       png_decoder.c font_jetbrains.c sha256.c hash_verify.c
+       png_decoder.c font_jetbrains.c sha256.c hash_verify.c text_menu.c
 OBJS = $(SRCS:.c=.o)
 
 FONT    ?= /usr/share/fonts/TTF/JetBrainsMono-Regular.ttf
