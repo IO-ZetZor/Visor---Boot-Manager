@@ -106,8 +106,7 @@ visor clean
 
 `visor install` passes its arguments through to `install.sh`. `visor sign`
 signs the installed EFI binary. `visor status` reports the current install
-state. `visor config validate` checks the syntax of a config file. `visor
-doctor` checks for common build dependencies.
+state. `visor config validate` checks the syntax of a config file.
 
 ### Updating
 
