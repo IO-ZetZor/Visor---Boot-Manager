@@ -20,6 +20,7 @@ EFI_DEVICE_PATH* windows_make_file_path(EFI_HANDLE handle,
 
 EFI_STATUS efi_chainload(EFI_HANDLE image_handle,
                          EFI_SYSTEM_TABLE *system_table,
-                         CHAR16 *path);
+                         CHAR16 *path,
+                         CHAR16 *partition_uuid);
 
 #endif
