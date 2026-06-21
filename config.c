@@ -20,6 +20,27 @@ static CHAR16* trim(CHAR16 *s) {
     return s;
 }
 
+static int is_space16(CHAR16 c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static void strip_inline_comment(CHAR16 *s) {
+    int in_quote = 0;
+    UINTN first = 0;
+    while (s[first] && is_space16(s[first])) first++;
+
+    for (UINTN i = 0; s[i]; i++) {
+        if (s[i] == '"') {
+            in_quote = !in_quote;
+            continue;
+        }
+        if (!in_quote && s[i] == '#' && i != first && (i == 0 || is_space16(s[i - 1]))) {
+            s[i] = '\0';
+            return;
+        }
+    }
+}
+
 static CHAR16* dup_path(CHAR16 *value) {
     if (!value) return NULL;
 
@@ -77,6 +98,8 @@ static int parse_color(CHAR16 *s, color_t *out) {
     return 1;
 }
 
+static CHAR16* read_text_file(CHAR16 *path);
+
 /* 'emilia-chan' */
 static UINTN parse_uint(CHAR16 *s) {
     UINTN n = 0;
@@ -117,6 +140,7 @@ static EFI_STATUS parse_entry(config_t *config, CHAR16 **lines, UINTN *idx, UINT
         if (eq) {
             *eq = '\0';
             CHAR16 *key = trim(line);
+            strip_inline_comment(eq + 1);
             CHAR16 *value = trim(eq + 1);
 
             if (efi_strcmp(key, L"name") == 0) {
@@ -276,6 +300,47 @@ static CHAR16* find_initrd(EFI_FILE_PROTOCOL *root, CHAR16 *dir, CHAR16 *kernel_
     return NULL;
 }
 
+static CHAR16* first_refind_cmdline(void) {
+    CHAR16 *buf = read_text_file(L"\\refind_linux.conf");
+    if (!buf) return NULL;
+
+    CHAR16 *start = buf;
+    while (*start) {
+        CHAR16 *end = start;
+        while (*end && *end != '\n') end++;
+        if (*end == '\n') *end = '\0';
+
+        CHAR16 *line = trim(start);
+        if (line[0] != '#' && line[0] != '\0') {
+            int quote = 0;
+            CHAR16 *cmd_start = NULL;
+            CHAR16 *cmd_end = NULL;
+            for (UINTN i = 0; line[i]; i++) {
+                if (line[i] != '"') continue;
+                quote++;
+                if (quote == 3) {
+                    cmd_start = line + i + 1;
+                } else if (quote == 4) {
+                    cmd_end = line + i;
+                    break;
+                }
+            }
+            if (cmd_start && cmd_end && cmd_end > cmd_start) {
+                *cmd_end = '\0';
+                CHAR16 *out = efi_strdup(cmd_start);
+                efi_free_pool(buf);
+                efi_log(L"config: imported Linux cmdline from \\refind_linux.conf");
+                return out;
+            }
+        }
+
+        start = end + 1;
+    }
+
+    efi_free_pool(buf);
+    return NULL;
+}
+
 static int scan_kernel_dir(config_t *config, EFI_FILE_PROTOCOL *root, CHAR16 *dir) {
     EFI_FILE_PROTOCOL *d = efi_open_dir(root, dir);
     if (!d) return 0;
@@ -296,7 +361,7 @@ static int scan_kernel_dir(config_t *config, EFI_FILE_PROTOCOL *root, CHAR16 *di
         if (initrd) efi_log(initrd);
 
         config_add_entry(config, efi_strdup(name), icon_path_for(L"unknown.png"),
-                         efi_strdup(path), initrd, NULL, NULL, 0);
+                         efi_strdup(path), initrd, first_refind_cmdline(), NULL, 0);
         added++;
     }
     d->Close(d);
@@ -561,6 +626,7 @@ static void apply_theme(config_t *config, CHAR16 *name) {
             if (eq) {
                 *eq = '\0';
                 CHAR16 *key = trim(line);
+                strip_inline_comment(eq + 1);
                 CHAR16 *value = trim(eq + 1);
                 if (efi_strcmp(key, L"theme") != 0)
                     apply_global(config, key, value);
@@ -657,6 +723,7 @@ EFI_STATUS config_parse(config_t *config) {
         if (eq) {
             *eq = '\0';
             CHAR16 *key = trim(line);
+            strip_inline_comment(eq + 1);
             CHAR16 *value = trim(eq + 1);
             apply_global(config, key, value);
             continue;
