@@ -69,6 +69,100 @@ CHAR16* efi_strchr(CHAR16 *s, CHAR16 c) {
     return (*s == c) ? s : NULL;
 }
 
+static int hex_digit(CHAR16 c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_hex_byte(CHAR16 *s, UINT8 *out) {
+    int hi = hex_digit(s[0]);
+    int lo = hex_digit(s[1]);
+    if (hi < 0 || lo < 0) return 0;
+    *out = (UINT8)((hi << 4) | lo);
+    return 1;
+}
+
+static int parse_partition_uuid(CHAR16 *s, EFI_GUID *out) {
+    if (!s || !out) return 0;
+    UINT8 raw[16];
+    int pos = 0;
+
+    for (UINTN i = 0; s[i];) {
+        if (s[i] == '-') {
+            i++;
+            continue;
+        }
+        if (!s[i + 1] || pos >= 16 || !parse_hex_byte(s + i, &raw[pos++]))
+            return 0;
+        i += 2;
+    }
+    if (pos != 16) return 0;
+
+    out->Data1 = ((UINT32)raw[0] << 24) | ((UINT32)raw[1] << 16) |
+                 ((UINT32)raw[2] << 8)  | raw[3];
+    out->Data2 = ((UINT16)raw[4] << 8) | raw[5];
+    out->Data3 = ((UINT16)raw[6] << 8) | raw[7];
+    for (int i = 0; i < 8; i++) out->Data4[i] = raw[8 + i];
+    return 1;
+}
+
+int efi_handle_matches_partition_uuid(EFI_HANDLE handle, CHAR16 *partition_uuid) {
+    if (!partition_uuid || partition_uuid[0] == '\0') return 1;
+
+    EFI_GUID want;
+    if (!parse_partition_uuid(partition_uuid, &want)) return 0;
+
+    EFI_DEVICE_PATH *dp = NULL;
+    if (EFI_ERROR(BS->HandleProtocol(handle, &gEfiDevicePathProtocolGuid, (void**)&dp)) || !dp)
+        return 0;
+
+    EFI_DEVICE_PATH *node = dp;
+    while (!IsDevicePathEnd(node)) {
+        if (DevicePathType(node) == MEDIA_DEVICE_PATH &&
+            DevicePathSubType(node) == MEDIA_HARDDRIVE_DP) {
+            HARDDRIVE_DEVICE_PATH *hd = (HARDDRIVE_DEVICE_PATH*)node;
+            if (hd->SignatureType == SIGNATURE_TYPE_GUID &&
+                CompareMem(hd->Signature, &want, sizeof(want)) == 0)
+                return 1;
+        }
+        node = (EFI_DEVICE_PATH*)((UINT8*)node + DevicePathNodeLength(node));
+    }
+
+    return 0;
+}
+
+EFI_DEVICE_PATH* efi_make_file_path(EFI_HANDLE handle, CHAR16 *filename) {
+    EFI_DEVICE_PATH *dp = NULL;
+    BS->HandleProtocol(handle, &gEfiDevicePathProtocolGuid, (void**)&dp);
+    if (!dp) return NULL;
+
+    UINTN dp_len    = DevicePathSize(dp) - sizeof(EFI_DEVICE_PATH_PROTOCOL);
+    UINTN fname_len = StrLen(filename) * sizeof(CHAR16);
+    UINTN fp_size   = sizeof(FILEPATH_DEVICE_PATH) + fname_len;
+    UINTN end_size  = sizeof(EFI_DEVICE_PATH_PROTOCOL);
+    UINTN total_len = dp_len + fp_size + end_size;
+
+    UINT8 *new_dp = efi_allocate_pool(total_len);
+    if (!new_dp) return NULL;
+
+    CopyMem(new_dp, dp, dp_len);
+
+    FILEPATH_DEVICE_PATH *fp = (FILEPATH_DEVICE_PATH*)(new_dp + dp_len);
+    fp->Header.Type    = MEDIA_DEVICE_PATH;
+    fp->Header.SubType = MEDIA_FILEPATH_DP;
+    SetDevicePathNodeLength(&fp->Header, (UINT16)fp_size);
+    StrCpy(fp->PathName, filename);
+
+    EFI_DEVICE_PATH_PROTOCOL *end = (EFI_DEVICE_PATH_PROTOCOL*)(new_dp + dp_len + fp_size);
+    end->Type    = END_DEVICE_PATH_TYPE;
+    end->SubType = END_ENTIRE_DEVICE_PATH_SUBTYPE;
+    SetDevicePathNodeLength(end, (UINT16)end_size);
+
+    return (EFI_DEVICE_PATH*)new_dp;
+}
+
 efi_file_t* efi_fopen(CHAR16 *path) {
     efi_file_t *file = efi_allocate_pool(sizeof(efi_file_t));
     if (!file) return NULL;
@@ -176,6 +270,47 @@ EFI_FILE_PROTOCOL* efi_open_dir(EFI_FILE_PROTOCOL *root, CHAR16 *path) {
     if (EFI_ERROR(root->Open(root, &d, path, EFI_FILE_MODE_READ, 0)))
         return NULL;
     return d;
+}
+
+EFI_DEVICE_PATH* efi_file_device_path(CHAR16 *path, CHAR16 *partition_uuid) {
+    EFI_HANDLE boot_handle = boot_device_handle();
+    EFI_FILE_PROTOCOL *root = open_root_on_handle(boot_handle);
+    if (root) {
+        if (efi_handle_matches_partition_uuid(boot_handle, partition_uuid) &&
+            efi_file_exists_root(root, path)) {
+            root->Close(root);
+            return efi_make_file_path(boot_handle, path);
+        }
+        root->Close(root);
+    }
+
+    UINTN count = 0;
+    EFI_HANDLE *handles = efi_locate_handle_buffer(
+        &gEfiSimpleFileSystemProtocolGuid, &count);
+    if (!handles) return NULL;
+
+    EFI_DEVICE_PATH *dp = NULL;
+    for (UINTN i = 0; i < count; i++) {
+        if (!efi_handle_matches_partition_uuid(handles[i], partition_uuid))
+            continue;
+
+        EFI_FILE_IO_INTERFACE *io = NULL;
+        if (EFI_ERROR(BS->HandleProtocol(handles[i],
+                &gEfiSimpleFileSystemProtocolGuid, (void**)&io)) || !io)
+            continue;
+
+        EFI_FILE_PROTOCOL *r = NULL;
+        if (EFI_ERROR(io->OpenVolume(io, &r)) || !r)
+            continue;
+
+        if (efi_file_exists_root(r, path))
+            dp = efi_make_file_path(handles[i], path);
+        r->Close(r);
+        if (dp) break;
+    }
+
+    efi_free_pool(handles);
+    return dp;
 }
 
 int efi_read_dirent(EFI_FILE_PROTOCOL *dir, CHAR16 *name_out, UINTN name_cap, int *is_dir) {
