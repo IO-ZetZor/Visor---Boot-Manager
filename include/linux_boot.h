@@ -65,7 +65,7 @@ typedef struct {
 #define LINUX_SIGNATURE 0x53726452
 #define HANDOVER_MASK   0x01
 
-EFI_STATUS linux_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st);
+EFI_STATUS visor_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st);
 
 EFI_STATUS linux_load_initrd(boot_entry_t *entry,
                              UINT32 *addr,
