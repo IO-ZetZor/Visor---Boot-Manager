@@ -160,18 +160,31 @@ background=\EFI\visor\backgrounds\default.png
 
 # ----------------------------------------------------------------------------
 #  Boot entry format
-#    entry-type {                 (entry-type is "linux" or "windows")
+#    entry {                                   
 #        name      = "Display Name"
-#        type      = linux | windows
 #        icon      = \path\to\icon.png
 #        icon_size = 128                       (optional - overrides global icon_size)
 #        kernel    = \path\to\kernel-or-efi
-#        initrd    = \path\to\initrd          (linux only, optional)
-#        cmdline   = "kernel command line"     (linux only, optional)
+#        initrd    = \path\to\initrd          (optional - Linux stub kernels)
+#        cmdline   = "kernel command line"     (optional)
+#        options   = "kernel command line"     (alias for cmdline; systemd-boot style)
 #        color     = #RRGGBB                   (optional per-entry name color)
-#        uuid      = partition-uuid            (windows chainload hint, optional)
+#        uuid      = partition-uuid            (optional - pin which partition the
+#                                               kernel/bootmgr lives on, by PARTUUID)
 #        sha256    = <64 hex chars>            (optional - pin the image hash)
 #    }
+#
+#  There is no longer a separate "linux"/"windows" block or a "type=" key:
+#  Visor auto-detects how to boot each entry from the image itself -
+#      * a PE image with no initrd/cmdline   -> chainloaded (e.g. Windows
+#        bootmgfw.efi); loaded by device path so its BCD is found
+#      * a PE image (UKI, or EFI-stub vmlinuz) -> LoadImage/StartImage, with
+#        cmdline and initrd applied if given (initrd via the standard
+#        LINUX_EFI_INITRD_MEDIA_GUID protocol, the same mechanism systemd-boot
+#        uses - so a plain vmlinuz + separate initramfs boots without a UKI)
+#      * a raw (non-PE) kernel               -> Linux EFI handover boot-params
+#  The block names "linux" and "windows" are still accepted as aliases for
+#  "entry" (old configs keep working), but they no longer affect booting.
 #
 #  Auto-detection (used only when boot.conf is absent, or has no entries):
 #    Visor scans the ESP for kernels instead of guessing fixed paths -
@@ -184,9 +197,8 @@ background=\EFI\visor\backgrounds\default.png
 # Linux example - EFI stub kernel or Unified Kernel Image (UKI).
 # For a UKI, point "kernel" at the .efi and omit initrd/cmdline.
 # For a plain stub kernel, supply initrd and cmdline as shown.
-#linux {
+#entry {
 #    name    = "Arch Linux"
-#    type    = linux
 #    icon    = \EFI\visor\icons\arch.png
 #    color   = #1793D1
 #    kernel  = \vmlinuz-linux
@@ -195,10 +207,11 @@ background=\EFI\visor\backgrounds\default.png
 #}
 
 # Windows example - chainloads the Windows Boot Manager. "kernel" is the path
-# to bootmgfw.efi; Visor loads it via its device path so the BCD is found.
-#windows {
-#    name   = "Windows 11"
-#    type   = windows
+# to bootmgfw.efi; Visor detects the PE image and loads it via its device path
+# so the BCD is found. No type= needed.
+#entry {
+#    name   = "Windows"
 #    icon   = \EFI\visor\icons\windows.png
 #   kernel = \EFI\Microsoft\Boot\bootmgfw.efi
 #}
+
