@@ -1,6 +1,8 @@
 
 #include "linux_boot.h"
+#include "windows_boot.h"
 #include "efi_helpers.h"
+#include "hash_verify.h"
 #include <efi.h>
 #include <efilib.h>
 
@@ -28,6 +30,67 @@ static UINTN strlen16(CHAR16 *s) {
     UINTN len = 0;
     while (s[len]) len++;
     return len;
+}
+
+#define LINUX_EFI_INITRD_MEDIA_GUID \
+    { 0x5568e427, 0x68fc, 0x4f3d, { 0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68 } }
+
+typedef struct {
+    VENDOR_DEVICE_PATH vendor;
+    EFI_DEVICE_PATH    end;
+} initrd_dev_path_t;
+
+static void  *g_initrd_data = NULL;
+static UINTN  g_initrd_size = 0;
+
+static EFI_STATUS EFIAPI initrd_load_file(EFI_LOAD_FILE2_PROTOCOL *This,
+                                          EFI_DEVICE_PATH_PROTOCOL *FilePath,
+                                          BOOLEAN BootPolicy, UINTN *BufferSize, VOID *Buffer) {
+    (void)This; (void)FilePath;
+    if (BootPolicy) return EFI_UNSUPPORTED;
+    if (!BufferSize) return EFI_INVALID_PARAMETER;
+    if (!g_initrd_data || g_initrd_size == 0) return EFI_NOT_FOUND;
+    if (Buffer == NULL || *BufferSize < g_initrd_size) {
+        *BufferSize = g_initrd_size;
+        return EFI_BUFFER_TOO_SMALL;
+    }
+    CopyMem(Buffer, g_initrd_data, g_initrd_size);
+    *BufferSize = g_initrd_size;
+    return EFI_SUCCESS;
+}
+
+static EFI_LOAD_FILE2_PROTOCOL initrd_lf2 = { initrd_load_file };
+static initrd_dev_path_t initrd_dp = {
+    .vendor = {
+        .Header = { MEDIA_DEVICE_PATH, MEDIA_VENDOR_DP,
+                    { (UINT8)(sizeof(VENDOR_DEVICE_PATH) & 0xFF),
+                      (UINT8)((sizeof(VENDOR_DEVICE_PATH) >> 8) & 0xFF) } },
+        .Guid = LINUX_EFI_INITRD_MEDIA_GUID
+    },
+    .end = { END_DEVICE_PATH_TYPE, END_ENTIRE_DEVICE_PATH_SUBTYPE,
+             { (UINT8)sizeof(EFI_DEVICE_PATH), 0 } }
+};
+
+static EFI_HANDLE initrd_register(void *data, UINTN size) {
+    g_initrd_data = data;
+    g_initrd_size = size;
+    EFI_HANDLE h = NULL;
+    EFI_STATUS s = BS->InstallMultipleProtocolInterfaces(&h,
+        &gEfiDevicePathProtocolGuid, &initrd_dp,
+        &gEfiLoadFile2ProtocolGuid, &initrd_lf2,
+        NULL);
+    if (EFI_ERROR(s)) { g_initrd_data = NULL; g_initrd_size = 0; return NULL; }
+    return h;
+}
+
+static void initrd_unregister(EFI_HANDLE h) {
+    if (h)
+        BS->UninstallMultipleProtocolInterfaces(h,
+            &gEfiDevicePathProtocolGuid, &initrd_dp,
+            &gEfiLoadFile2ProtocolGuid, &initrd_lf2,
+            NULL);
+    g_initrd_data = NULL;
+    g_initrd_size = 0;
 }
 
 static void* load_kernel_file(CHAR16 *path, UINTN *size_out) {
@@ -133,15 +196,36 @@ static EFI_STATUS linux_setup_boot_params(void *kernel_data, UINTN kernel_size,
     return EFI_SUCCESS;
 }
 
-EFI_STATUS linux_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
+EFI_STATUS visor_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
     EFI_STATUS status;
     UINTN kernel_size = 0;
 
-    efi_print(L"Booting Linux: ");
+    efi_print(L"Booting: ");
     efi_print(entry->name);
     efi_print(L"\r\n");
 
-    efi_log(L"linux: loading kernel file");
+    if (!entry->kernel_path) {
+        efi_log(L"boot: no kernel path - searching for Windows Boot Manager");
+        EFI_DEVICE_PATH *bootmgr_dp = NULL;
+        status = windows_find_bootmgr(entry->uuid, &bootmgr_dp);
+        if (EFI_ERROR(status) || !bootmgr_dp) {
+            efi_log(L"ERROR: no kernel and no bootmgfw.efi found");
+            efi_print(L"Nothing to boot\r\n");
+            return EFI_NOT_FOUND;
+        }
+        EFI_HANDLE bh;
+        status = BS->LoadImage(FALSE, IH, bootmgr_dp, NULL, 0, &bh);
+        efi_free_pool(bootmgr_dp);
+        if (EFI_ERROR(status)) {
+            efi_log(L"ERROR: LoadImage failed for bootmgfw.efi");
+            efi_print(L"LoadImage failed\r\n");
+            return status;
+        }
+        efi_log(L"boot: StartImage() - handing control to Windows Boot Manager");
+        return BS->StartImage(bh, NULL, NULL);
+    }
+
+    efi_log(L"boot: loading kernel/image file");
     efi_log(entry->kernel_path);
     void *kernel_data = load_kernel_file(entry->kernel_path, &kernel_size);
     if (!kernel_data) {
@@ -150,14 +234,9 @@ EFI_STATUS linux_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
         return EFI_NOT_FOUND;
     }
 
-    UINT32 initrd_addr = 0, initrd_size = 0;
-    if (entry->initrd_path) {
-        efi_log(L"linux: loading initrd");
-        status = linux_load_initrd_impl(entry->initrd_path, &initrd_addr, &initrd_size);
-        if (EFI_ERROR(status)) {
-            efi_log(L"WARN: initrd load failed - continuing without it");
-            efi_print(L"Warning: Could not load initrd\r\n");
-        }
+    if (!visor_hash_ok(entry, kernel_data, kernel_size)) {
+        efi_free_pool(kernel_data);
+        return EFI_SECURITY_VIOLATION;
     }
 
     UINT8 *kernel = (UINT8*)kernel_data;
@@ -165,8 +244,16 @@ EFI_STATUS linux_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
     if (kernel[0] == 'M' && kernel[1] == 'Z') {
         EFI_HANDLE kernel_handle;
 
-        efi_log(L"linux: PE/UKI image, LoadImage()");
-        status = BS->LoadImage(FALSE, IH, NULL, kernel_data, kernel_size, &kernel_handle);
+        efi_log(L"boot: PE image (Windows/UKI/EFI-stub), LoadImage()");
+        EFI_DEVICE_PATH *kernel_dp = efi_file_device_path(entry->kernel_path, entry->uuid);
+        if (kernel_dp) {
+            status = BS->LoadImage(FALSE, IH, kernel_dp, NULL, 0, &kernel_handle);
+            efi_free_pool(kernel_dp);
+        } else {
+            efi_log(L"WARN: could not build device path - loading from source buffer");
+            status = BS->LoadImage(FALSE, IH, NULL, kernel_data, kernel_size, &kernel_handle);
+        }
+        efi_free_pool(kernel_data);
         if (EFI_ERROR(status)) {
             efi_log(L"ERROR: LoadImage failed (not a valid EFI image?)");
             efi_print(L"LoadImage failed\r\n");
@@ -179,6 +266,29 @@ EFI_STATUS linux_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
             if (!EFI_ERROR(status)) {
                 loaded->LoadOptions     = entry->cmdline;
                 loaded->LoadOptionsSize = (UINT32)((strlen16(entry->cmdline) + 1) * sizeof(CHAR16));
+                efi_log(L"linux: cmdline set via LoadOptions");
+            }
+        }
+
+        efi_file_buffer_t *initrd_buf = NULL;
+        EFI_HANDLE initrd_handle = NULL;
+        if (entry->initrd_path) {
+            efi_log(L"linux: loading initrd for stub (LINUX_EFI_INITRD_MEDIA)");
+            efi_log(entry->initrd_path);
+            initrd_buf = efi_load_file(entry->initrd_path);
+            if (initrd_buf && initrd_buf->data && initrd_buf->size) {
+                initrd_handle = initrd_register(initrd_buf->data, initrd_buf->size);
+                if (initrd_handle) {
+                    CHAR16 m[72];
+                    SPrint(m, sizeof(m), L"linux: initrd ready, %d bytes via LoadFile2 media path",
+                           (int)initrd_buf->size);
+                    efi_log(m);
+                } else {
+                    efi_log(L"WARN: could not install initrd LoadFile2 protocol");
+                }
+            } else {
+                efi_log(L"WARN: initrd load failed - continuing without it");
+                efi_print(L"Warning: Could not load initrd\r\n");
             }
         }
 
@@ -186,7 +296,22 @@ EFI_STATUS linux_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
         status = BS->StartImage(kernel_handle, NULL, NULL);
 
         efi_log(L"ERROR: kernel StartImage returned - boot failed");
+        if (initrd_handle) initrd_unregister(initrd_handle);
+        if (initrd_buf) {
+            if (initrd_buf->data) efi_free_pool(initrd_buf->data);
+            efi_free_pool(initrd_buf);
+        }
         return status;
+    }
+
+    UINT32 initrd_addr = 0, initrd_size = 0;
+    if (entry->initrd_path) {
+        efi_log(L"linux: loading initrd (boot-params ramdisk)");
+        status = linux_load_initrd_impl(entry->initrd_path, &initrd_addr, &initrd_size);
+        if (EFI_ERROR(status)) {
+            efi_log(L"WARN: initrd load failed - continuing without it");
+            efi_print(L"Warning: Could not load initrd\r\n");
+        }
     }
 
     status = linux_setup_boot_params(kernel_data, kernel_size,
