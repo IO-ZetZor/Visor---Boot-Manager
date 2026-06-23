@@ -14,6 +14,7 @@ SECTIONS
    *(.eh_frame_hdr)
    *(.gcc_except_table*)
    *(.note.GNU-stack)
+   *(.note.gnu.property)
   }
   . = ALIGN(4096);
   .text :
