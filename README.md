@@ -44,7 +44,7 @@ Visor draws an icon-based boot menu which combines the efficiency and speed of g
 | Debian / Ubuntu   | `sudo apt install gnu-efi build-essential`         |
 | Fedora            | `sudo dnf install gnu-efi gnu-efi-devel gcc make`  |
 | openSUSE          | `sudo zypper in gnu-efi-devel gcc make`            |
-| Void              | `sudo xbps-install gnu-efi gcc make`               |
+| Void              | `sudo xbps-install gnu-efi-libs gcc make`               |
 
 ---
 
