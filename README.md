@@ -69,9 +69,22 @@ of a cryptic compiler error.
 
 ## Installation
 
-### Quick install 
+### One-line install
+
+Installs the build tools for your distro, downloads Visor, builds it, and
+installs it — all in one go:
+
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/IO-ZetZor/Visor-BootManager/main/get.sh)"
+```
+
+(or with `wget`: `sh -c "$(wget -qO- https://raw.githubusercontent.com/IO-ZetZor/Visor-BootManager/main/get.sh)"`)
+
+### Manual install 
 
 ```bash
+git clone https://github.com/IO-ZetZor/Visor-BootManager.git
+cd Visor-BootManager
 sudo ./install.sh
 ```
 *Options:**
@@ -129,7 +142,7 @@ wrong, and `visor update --sign` if you want the updated binary signed with
 `sbctl`.
 
 ```
-### Manual installation
+### Manual installation to ESP
 
 ```bash
 # 1. Mount the ESP (skip if already mounted at /boot/efi).
