@@ -45,6 +45,22 @@ typedef struct {
 #define FOCUS_ENTRIES  0
 #define FOCUS_POWER    1
 
+#define DEPLOY_CURRENT  0
+#define DEPLOY_ROLLBACK 1
+#define DEPLOY_OLDER    2
+#define DEPLOY_PINNED   3
+
+typedef struct deployment {
+    CHAR16 *version;
+    CHAR16 *kernel;
+    CHAR16 *initrd;
+    CHAR16 *cmdline;
+    CHAR16 *bls_path;
+    int     role;
+    int     tries_left;
+    int     tries_done;
+} deployment_t;
+
 typedef struct boot_entry {
     struct boot_entry *next;
     CHAR16 *name;
@@ -61,6 +77,11 @@ typedef struct boot_entry {
     int     has_color;
     UINT8   sha256[32];
     int     has_sha256;
+
+    deployment_t *deployments;
+    UINTN   deploy_count;
+    UINTN   deploy_default;
+    UINTN   deploy_sel;
 } boot_entry_t;
 
 typedef struct {
@@ -161,6 +182,11 @@ typedef struct {
 
     icon_t *background;
     CHAR16 *background_path;
+
+    int     version_mode;
+    int     ver_fading;
+    int     ver_frame;
+    int     ver_dir;
 
     int     editor_enabled;
     int     editing;
