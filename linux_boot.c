@@ -232,6 +232,7 @@ EFI_STATUS visor_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
             return status;
         }
         efi_log(L"boot: StartImage() - handing control to Windows Boot Manager");
+        efi_log_close();
         return BS->StartImage(bh, NULL, NULL);
     }
 
@@ -313,6 +314,7 @@ EFI_STATUS visor_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
         }
 
         efi_log(L"linux: StartImage() - handing control to kernel stub");
+        efi_log_close();
         status = BS->StartImage(kernel_handle, NULL, NULL);
 
         efi_log(L"ERROR: kernel StartImage returned - boot failed");
@@ -365,6 +367,7 @@ EFI_STATUS visor_boot(boot_entry_t *entry, EFI_SYSTEM_TABLE *st) {
     UINTN map_size, map_key, desc_size;
     UINT32 desc_ver;
 
+    efi_log_close();
     status = get_map_and_exit(&map, &map_size, &map_key, &desc_size, &desc_ver);
     if (EFI_ERROR(status)) return status;
 
